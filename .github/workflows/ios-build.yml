@@ -1,0 +1,247 @@
+# Builds an iOS app from a private repo and uploads it to TestFlight.
+# Everything app-specific lives in GitHub Secrets (slot prefix APPn_*). Tool output goes to an
+# encrypted log only; the public log shows step status lines and nothing else.
+name: ios-build
+run-name: iOS build
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App slot
+        type: choice
+        options: [APP1, APP2, APP3, APP4]
+        default: APP1
+      build_number:
+        description: Build number (CFBundleVersion)
+        required: true
+        type: string
+      upload:
+        description: Upload to TestFlight
+        type: boolean
+        default: true
+      xcode:
+        description: Xcode version (empty = runner default)
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -eo pipefail {0}
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Prepare
+        env:
+          APP_REPO: ${{ secrets[format('{0}_REPO', inputs.app)] }}
+          APP_SUBDIR: ${{ secrets[format('{0}_SUBDIR', inputs.app)] }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          [[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || { echo "invalid build number"; exit 1; }
+          [ -n "$APP_REPO" ] || { echo "slot not configured"; exit 1; }
+          for v in "$APP_REPO" "${APP_REPO#*/}" "${APP_REPO%%/*}"; do echo "::add-mask::$v"; done
+          echo "LOG=$RUNNER_TEMP/build.log" >> "$GITHUB_ENV"
+          echo "SRC=$RUNNER_TEMP/src/$APP_SUBDIR" >> "$GITHUB_ENV"
+          : > "$RUNNER_TEMP/build.log"
+          echo "✔ ok"
+
+      - name: Checkout source
+        env:
+          APP_REPO: ${{ secrets[format('{0}_REPO', inputs.app)] }}
+          DEPLOY_KEY: ${{ secrets[format('{0}_DEPLOY_KEY', inputs.app)] }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          K="$RUNNER_TEMP/dk"; umask 077; printf '%s\n' "$DEPLOY_KEY" > "$K"
+          GIT_SSH_COMMAND="ssh -i $K -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git clone -q --depth 1 "git@github.com:${APP_REPO}.git" "$RUNNER_TEMP/src"
+          rm -f "$K"
+          git -C "$RUNNER_TEMP/src" log -1 --format='commit %H %s'
+          echo "✔ ok" >&3
+
+      - name: Select Xcode
+        env:
+          XCODE: ${{ inputs.xcode }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "/Applications/Xcode_${XCODE}.app"; fi
+          xcodebuild -version
+          echo "✔ $(xcodebuild -version | head -1)" >&3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install JS dependencies
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC"; node -v; npm -v
+          npm ci --no-audit --no-fund
+          echo "✔ ok" >&3
+
+      - name: Signing setup
+        env:
+          P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          PROFILE_B64: ${{ secrets[format('{0}_PROFILE_B64', inputs.app)] }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          umask 077; T="$RUNNER_TEMP"
+          KCP=$(openssl rand -hex 24); echo "::add-mask::$KCP" >&3
+          KC="$T/sign.keychain-db"
+          security create-keychain -p "$KCP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCP" "$KC"
+          printf '%s' "$P12_B64" | base64 --decode > "$T/d.p12"
+          security import "$T/d.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          rm -f "$T/d.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCP" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          SHA1=$(security find-identity -v -p codesigning "$KC" | awk 'NR==1{print $2}')
+          [ -n "$SHA1" ]; echo "::add-mask::$SHA1" >&3
+          printf '%s' "$PROFILE_B64" | base64 --decode > "$T/p.mobileprovision"
+          security cms -D -i "$T/p.mobileprovision" > "$T/p.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$T/p.plist")
+          APPID=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$T/p.plist")
+          BUNDLE_ID="${APPID#*.}"
+          for v in "$UUID" "$BUNDLE_ID"; do echo "::add-mask::$v" >&3; done
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$d"; cp "$T/p.mobileprovision" "$d/$UUID.mobileprovision"; done
+          { echo "KC=$KC"; echo "SIGN_SHA1=$SHA1"; echo "PROFILE_UUID=$UUID"; echo "BUNDLE_ID=$BUNDLE_ID"; } >> "$GITHUB_ENV"
+          echo "✔ ok" >&3
+
+      - name: Expo prebuild
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC"
+          CI=1 EXPO_NO_TELEMETRY=1 npx expo prebuild -p ios --clean --no-install
+          WS=$(ls -d ios/*.xcworkspace 2>/dev/null | head -1); PRJ=$(ls -d ios/*.xcodeproj | head -1)
+          NAME=$(basename "$PRJ" .xcodeproj); echo "::add-mask::$NAME" >&3
+          PL="ios/$NAME/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$PL"
+          /usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$PL" || true
+          echo "SCHEME=$NAME" >> "$GITHUB_ENV"
+          echo "✔ ok" >&3
+
+      - name: Pod install
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC/ios"
+          pod install
+          echo "✔ ok" >&3
+
+      - name: Configure signing
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC/ios"
+          ruby -rxcodeproj -e '
+            p = Xcodeproj::Project.open("#{ENV["SCHEME"]}.xcodeproj")
+            ta = (p.root_object.attributes["TargetAttributes"] ||= {})
+            n = 0
+            p.native_targets.select { |t| t.product_type == "com.apple.product-type.application" }.each do |t|
+              (ta[t.uuid] ||= {})["ProvisioningStyle"] = "Manual"
+              t.build_configurations.each do |c|
+                s = c.build_settings
+                s["CODE_SIGN_STYLE"] = "Manual"
+                s["DEVELOPMENT_TEAM"] = ENV["TEAM"]
+                s["CODE_SIGN_IDENTITY"] = "iPhone Distribution"
+                s["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = "iPhone Distribution"
+                s["PROVISIONING_PROFILE_SPECIFIER"] = ENV["PROFILE_UUID"]
+                s["CURRENT_PROJECT_VERSION"] = ENV["BUILD_NUMBER"]
+                n += 1
+              end
+            end
+            raise "no app target" if n == 0
+            p.save'
+          echo "✔ ok" >&3
+
+      - name: Archive
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC/ios"
+          xcodebuild -workspace "$SCHEME.xcworkspace" -scheme "$SCHEME" -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KC" archive
+          echo "✔ ok" >&3
+
+      - name: Export IPA
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          O="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$O" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${TEAM}</string>
+            <key>signingCertificate</key><string>${SIGN_SHA1}</string>
+            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string></dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" -exportPath "$RUNNER_TEMP/export" -exportOptionsPlist "$O"
+          ls -la "$RUNNER_TEMP/export"
+          echo "✔ ok ($(du -h "$RUNNER_TEMP"/export/*.ipa | cut -f1 | tr -d ' '))" >&3
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_B64 }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          umask 077; D="$HOME/.appstoreconnect/private_keys"; mkdir -p "$D"
+          printf '%s' "$ASC_KEY_P8_B64" | base64 --decode > "$D/AuthKey_${ASC_KEY_ID}.p8"
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal
+          echo "✔ ok" >&3
+
+      - name: Cleanup
+        if: always()
+        run: |
+          exec 3>&1 >>"${LOG:-/dev/null}" 2>&1
+          [ -n "$KC" ] && security delete-keychain "$KC" || true
+          rm -rf "$HOME/.appstoreconnect" "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" "$RUNNER_TEMP/dk" "$RUNNER_TEMP/p.mobileprovision" "$RUNNER_TEMP/p.plist"
+          echo "✔ ok" >&3
+
+      - name: Encrypt log
+        if: always()
+        env:
+          LOG_PUBKEY: ${{ secrets.LOG_PUBKEY }}
+        run: |
+          exec 3>&1 >/dev/null 2>&1
+          O="$RUNNER_TEMP/enclog"; mkdir -p "$O"; [ -f "$LOG" ] || : > "$LOG"
+          OSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"; [ -x "$OSSL" ] || OSSL=openssl
+          K=$(openssl rand -hex 32); echo "::add-mask::$K" >&3
+          printf '%s\n' "$LOG_PUBKEY" > "$O/pub.pem"
+          printf '%s' "$K" | "$OSSL" pkeyutl -encrypt -pubin -inkey "$O/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -out "$O/key.bin"
+          gzip -c "$LOG" | "$OSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$K" -out "$O/log.gz.enc"
+          rm -f "$O/pub.pem" "$LOG"
+          echo "✔ ok" >&3
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ github.run_id }}
+          path: ${{ runner.temp }}/enclog/
+          retention-days: 1
+          if-no-files-found: ignore
