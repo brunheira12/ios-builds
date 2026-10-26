@@ -43,6 +43,7 @@ jobs:
         env:
           APP_REPO: ${{ secrets[format('{0}_REPO', inputs.app)] }}
           APP_SUBDIR: ${{ secrets[format('{0}_SUBDIR', inputs.app)] }}
+          APP_ENV: ${{ secrets[format('{0}_ENV', inputs.app)] }}
           BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
           [[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || { echo "invalid build number"; exit 1; }
@@ -51,6 +52,14 @@ jobs:
           echo "LOG=$RUNNER_TEMP/build.log" >> "$GITHUB_ENV"
           echo "SRC=$RUNNER_TEMP/src/$APP_SUBDIR" >> "$GITHUB_ENV"
           : > "$RUNNER_TEMP/build.log"
+          # optional per-app build-time env (KEY=VALUE lines); values are masked and kept in a 0600 file
+          E="$RUNNER_TEMP/app.env"; (umask 077; : > "$E")
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"; [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+            v="${line#*=}"; [ -n "$v" ] && echo "::add-mask::$v"
+            printf 'export %s=%q\n' "${line%%=*}" "$v" >> "$E"
+          done <<< "$APP_ENV"
+          echo "APP_ENV_FILE=$E" >> "$GITHUB_ENV"
           echo "✔ ok"
 
       - name: Checkout source
@@ -123,7 +132,7 @@ jobs:
           BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
-          cd "$SRC"
+          cd "$SRC"; . "$APP_ENV_FILE"
           CI=1 EXPO_NO_TELEMETRY=1 npx expo prebuild -p ios --clean --no-install
           PRJ=$(ls -d ios/*.xcodeproj | head -n1)
           NAME=$(basename "$PRJ" .xcodeproj); echo "::add-mask::$NAME" >&3
@@ -171,7 +180,7 @@ jobs:
       - name: Archive
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
-          cd "$SRC/ios"
+          cd "$SRC/ios"; . "$APP_ENV_FILE"
           xcodebuild -workspace "$SCHEME.xcworkspace" -scheme "$SCHEME" -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
             OTHER_CODE_SIGN_FLAGS="--keychain $KC" archive
@@ -220,7 +229,7 @@ jobs:
         run: |
           exec 3>&1 >>"${LOG:-/dev/null}" 2>&1
           [ -n "$KC" ] && security delete-keychain "$KC" || true
-          rm -rf "$HOME/.appstoreconnect" "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" "$RUNNER_TEMP/dk" "$RUNNER_TEMP/p.mobileprovision" "$RUNNER_TEMP/p.plist"
+          rm -rf "$HOME/.appstoreconnect" "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" "$RUNNER_TEMP/dk" "$RUNNER_TEMP/p.mobileprovision" "$RUNNER_TEMP/p.plist" "${APP_ENV_FILE:-}"
           echo "✔ ok" >&3
 
       - name: Encrypt log
