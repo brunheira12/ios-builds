@@ -125,7 +125,7 @@ jobs:
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
           cd "$SRC"
           CI=1 EXPO_NO_TELEMETRY=1 npx expo prebuild -p ios --clean --no-install
-          WS=$(ls -d ios/*.xcworkspace 2>/dev/null | head -1); PRJ=$(ls -d ios/*.xcodeproj | head -1)
+          PRJ=$(ls -d ios/*.xcodeproj | head -n1)
           NAME=$(basename "$PRJ" .xcodeproj); echo "::add-mask::$NAME" >&3
           PL="ios/$NAME/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$PL"
