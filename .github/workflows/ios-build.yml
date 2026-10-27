@@ -9,7 +9,7 @@ on:
       app:
         description: App slot
         type: choice
-        options: [APP1, APP2, APP3, APP4]
+        options: [APP1, APP2, APP3, APP4, APP5]
         default: APP1
       build_number:
         description: Build number (CFBundleVersion)
@@ -254,3 +254,4 @@ jobs:
           path: ${{ runner.temp }}/enclog/
           retention-days: 1
           if-no-files-found: ignore
+
