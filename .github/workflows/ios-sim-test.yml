@@ -1,0 +1,111 @@
+# TEMPORARY: build an app slot for the iOS Simulator (Release, unsigned), launch it and capture crash info.
+# All tool output goes to an encrypted log only.
+name: ios-sim-test
+run-name: iOS sim test
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App slot
+        type: choice
+        options: [APP6]
+        default: APP6
+      ref:
+        description: Git ref to test (empty = default branch)
+        type: string
+        default: ''
+permissions: {}
+concurrency:
+  group: ios-build
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash --noprofile --norc -eo pipefail {0}
+jobs:
+  sim:
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - name: Prepare
+        env:
+          APP_REPO: ${{ secrets[format('{0}_REPO', inputs.app)] }}
+          APP_SUBDIR: ${{ secrets[format('{0}_SUBDIR', inputs.app)] }}
+        run: |
+          [ -n "$APP_REPO" ] || { echo "slot not configured"; exit 1; }
+          for v in "$APP_REPO" "${APP_REPO#*/}" "${APP_REPO%%/*}"; do echo "::add-mask::$v"; done
+          echo "LOG=$RUNNER_TEMP/build.log" >> "$GITHUB_ENV"
+          echo "SRC=$RUNNER_TEMP/src/$APP_SUBDIR" >> "$GITHUB_ENV"
+          : > "$RUNNER_TEMP/build.log"
+          echo "✔ ok"
+      - name: Checkout source
+        env:
+          APP_REPO: ${{ secrets[format('{0}_REPO', inputs.app)] }}
+          DEPLOY_KEY: ${{ secrets[format('{0}_DEPLOY_KEY', inputs.app)] }}
+          REF: ${{ inputs.ref }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          K="$RUNNER_TEMP/dk"; umask 077; printf '%s\n' "$DEPLOY_KEY" > "$K"
+          GIT_SSH_COMMAND="ssh -i $K -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git clone -q "git@github.com:${APP_REPO}.git" "$RUNNER_TEMP/src"
+          rm -f "$K"
+          [ -z "$REF" ] || git -C "$RUNNER_TEMP/src" checkout -q "$REF"
+          git -C "$RUNNER_TEMP/src" log -1 --format='commit %H %s'
+          echo "✔ ok" >&3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install, prebuild, pods
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC"; npm ci --no-audit --no-fund
+          CI=1 EXPO_NO_TELEMETRY=1 npx expo prebuild -p ios --clean --no-install
+          cd ios && pod install
+          echo "PODS:"; ls Pods | sort
+          echo "✔ ok" >&3
+      - name: Build for simulator
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC/ios"; NAME=$(basename "$(ls -d *.xcworkspace | head -1)" .xcworkspace)
+          xcodebuild -workspace "$NAME.xcworkspace" -scheme "$NAME" -configuration Release -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO build | tail -50
+          echo "APP=$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Release-iphonesimulator/*.app | head -1)" >> "$GITHUB_ENV"
+          echo "✔ ok" >&3
+      - name: Launch on simulator
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print([x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone')][-1])")
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" "$APP"
+          BID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl spawn "$UDID" log stream --style compact --level debug --predicate 'process CONTAINS "Contatos"' > "$RUNNER_TEMP/stream.log" 2>&1 &
+          LP=$!; sleep 3
+          xcrun simctl launch "$UDID" "$BID" || true
+          sleep 25
+          kill $LP || true
+          echo "=== alive?"; xcrun simctl spawn "$UDID" launchctl list | grep -i "$BID" || echo "NOT RUNNING"
+          echo "=== stream (filtered)"; grep -iE "fatal|exception|error|terminat|abort|crash|JS|Unhandled|RCT" "$RUNNER_TEMP/stream.log" | head -300
+          echo "=== crash reports"; for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -3); do echo "--- $f"; head -c 60000 "$f"; done
+          xcrun simctl io "$UDID" screenshot "$RUNNER_TEMP/shot.png" || true
+          echo "✔ ok" >&3
+      - name: Encrypt log
+        if: always()
+        env:
+          LOG_PUBKEY: ${{ secrets.LOG_PUBKEY }}
+        run: |
+          exec 3>&1 >/dev/null 2>&1
+          O="$RUNNER_TEMP/enclog"; mkdir -p "$O"; [ -f "$LOG" ] || : > "$LOG"
+          OSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"; [ -x "$OSSL" ] || OSSL=openssl
+          K=$(openssl rand -hex 32); echo "::add-mask::$K" >&3
+          printf '%s\n' "$LOG_PUBKEY" > "$O/pub.pem"
+          printf '%s' "$K" | "$OSSL" pkeyutl -encrypt -pubin -inkey "$O/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -out "$O/key.bin"
+          [ -f "$RUNNER_TEMP/shot.png" ] && cat "$RUNNER_TEMP/shot.png" | base64 | sed 's/^/SHOT:/' >> "$LOG" || true
+          gzip -c "$LOG" | "$OSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$K" -out "$O/log.gz.enc"
+          rm -f "$O/pub.pem" "$LOG"
+          echo "✔ ok" >&3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ github.run_id }}
+          path: ${{ runner.temp }}/enclog/
+          retention-days: 1
+          if-no-files-found: ignore
