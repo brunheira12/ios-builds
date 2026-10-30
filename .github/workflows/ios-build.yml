@@ -9,7 +9,7 @@ on:
       app:
         description: App slot
         type: choice
-        options: [APP1, APP2, APP3, APP4, APP5, APP6]
+        options: [APP1, APP2, APP3, APP4, APP5, APP6, APP7]
         default: APP1
       build_number:
         description: Build number (CFBundleVersion)
@@ -73,7 +73,12 @@ jobs:
             git clone -q --depth 1 "git@github.com:${APP_REPO}.git" "$RUNNER_TEMP/src"
           rm -f "$K"
           git -C "$RUNNER_TEMP/src" log -1 --format='commit %H %s'
-          echo "✔ ok" >&3
+          # native Xcode project (xcodegen project.yml or committed .xcodeproj, no package.json) skips Expo/npm
+          if [ ! -f "$SRC/package.json" ] && { [ -f "$SRC/project.yml" ] || compgen -G "$SRC/*.xcodeproj" >/dev/null; }; then
+            echo "NATIVE=1" >> "$GITHUB_ENV"; echo "✔ ok (native)" >&3
+          else
+            echo "NATIVE=0" >> "$GITHUB_ENV"; echo "✔ ok" >&3
+          fi
 
       - name: Select Xcode
         env:
@@ -85,10 +90,12 @@ jobs:
           echo "✔ $(xcodebuild -version | head -1)" >&3
 
       - uses: actions/setup-node@v4
+        if: ${{ env.NATIVE != '1' }}
         with:
           node-version: 22
 
       - name: Install JS dependencies
+        if: ${{ env.NATIVE != '1' }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
           cd "$SRC"; node -v; npm -v
@@ -100,6 +107,7 @@ jobs:
           P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
           P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
           PROFILE_B64: ${{ secrets[format('{0}_PROFILE_B64', inputs.app)] }}
+          WATCH_PROFILE_B64: ${{ secrets[format('{0}_WATCH_PROFILE_B64', inputs.app)] }}
           TEAM: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
@@ -125,9 +133,22 @@ jobs:
           for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
             mkdir -p "$d"; cp "$T/p.mobileprovision" "$d/$UUID.mobileprovision"; done
           { echo "KC=$KC"; echo "SIGN_SHA1=$SHA1"; echo "PROFILE_UUID=$UUID"; echo "BUNDLE_ID=$BUNDLE_ID"; } >> "$GITHUB_ENV"
+          if [ -n "$WATCH_PROFILE_B64" ]; then
+            printf '%s' "$WATCH_PROFILE_B64" | base64 --decode > "$T/w.mobileprovision"
+            security cms -D -i "$T/w.mobileprovision" > "$T/w.plist"
+            WUUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$T/w.plist")
+            WAPPID=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$T/w.plist")
+            WBUNDLE_ID="${WAPPID#*.}"
+            for v in "$WUUID" "$WBUNDLE_ID"; do echo "::add-mask::$v" >&3; done
+            for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              cp "$T/w.mobileprovision" "$d/$WUUID.mobileprovision"; done
+            rm -f "$T/w.mobileprovision" "$T/w.plist"
+            { echo "WATCH_PROFILE_UUID=$WUUID"; echo "WATCH_BUNDLE_ID=$WBUNDLE_ID"; } >> "$GITHUB_ENV"
+          fi
           echo "✔ ok" >&3
 
       - name: Expo prebuild
+        if: ${{ env.NATIVE != '1' }}
         env:
           BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
@@ -143,6 +164,7 @@ jobs:
           echo "✔ ok" >&3
 
       - name: Pod install
+        if: ${{ env.NATIVE != '1' }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
           cd "$SRC/ios"
@@ -150,6 +172,7 @@ jobs:
           echo "✔ ok" >&3
 
       - name: Configure signing
+        if: ${{ env.NATIVE != '1' }}
         env:
           TEAM: ${{ secrets.APPLE_TEAM_ID }}
           BUILD_NUMBER: ${{ inputs.build_number }}
@@ -178,11 +201,73 @@ jobs:
           echo "✔ ok" >&3
 
       - name: Archive
+        if: ${{ env.NATIVE != '1' }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
           cd "$SRC/ios"; . "$APP_ENV_FILE"
           xcodebuild -workspace "$SCHEME.xcworkspace" -scheme "$SCHEME" -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KC" archive
+          echo "✔ ok" >&3
+
+      - name: Native project
+        if: ${{ env.NATIVE == '1' }}
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC"; . "$APP_ENV_FILE"
+          if [ -f project.yml ]; then
+            command -v xcodegen || HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install xcodegen
+            xcodegen generate --spec project.yml
+          fi
+          PRJ=$(ls -d *.xcodeproj | head -n1)
+          NAME=$(basename "$PRJ" .xcodeproj); echo "::add-mask::$NAME" >&3
+          ruby -rxcodeproj -e '
+            p = Xcodeproj::Project.open(ARGV[0])
+            prof = { ENV["BUNDLE_ID"] => ENV["PROFILE_UUID"] }
+            prof[ENV["WATCH_BUNDLE_ID"]] = ENV["WATCH_PROFILE_UUID"] if ENV["WATCH_BUNDLE_ID"].to_s != ""
+            types = ["com.apple.product-type.application", "com.apple.product-type.application.watchapp2-container",
+                     "com.apple.product-type.application.watchapp2", "com.apple.product-type.app-extension",
+                     "com.apple.product-type.watchkit2-extension", "com.apple.product-type.extensionkit-extension"]
+            ta = (p.root_object.attributes["TargetAttributes"] ||= {})
+            n = 0; ios = false; watch = false
+            p.native_targets.select { |t| types.include?(t.product_type) }.each do |t|
+              ios = true if t.product_type.end_with?("watchapp2-container")
+              (ta[t.uuid] ||= {})["ProvisioningStyle"] = "Manual"
+              t.build_configurations.each do |c|
+                s = c.build_settings
+                sdk = (s["SDKROOT"] || t.sdk.to_s)
+                watch = true if sdk.start_with?("watchos")
+                ios = true if sdk.start_with?("iphoneos")
+                bid = s["PRODUCT_BUNDLE_IDENTIFIER"]
+                uuid = prof[bid] or raise "no profile for target #{t.name}"
+                s["CODE_SIGN_STYLE"] = "Manual"
+                s["DEVELOPMENT_TEAM"] = ENV["TEAM"]
+                s["CODE_SIGN_IDENTITY"] = "iPhone Distribution"
+                s["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = "iPhone Distribution"
+                s["CODE_SIGN_IDENTITY[sdk=watchos*]"] = "iPhone Distribution"
+                s["PROVISIONING_PROFILE_SPECIFIER"] = uuid
+                s["CURRENT_PROJECT_VERSION"] = ENV["BUILD_NUMBER"]
+                n += 1
+              end
+            end
+            raise "no app target" if n == 0
+            p.save
+            # watch-only apps ship inside an iOS container and archive as iOS; a bare watchOS project archives as watchOS
+            File.write(ENV["GITHUB_ENV"], "DEST=generic/platform=#{(ios || !watch) ? "iOS" : "watchOS"}\n", mode: "a")' "$PRJ"
+          { echo "SCHEME=$NAME"; echo "PRJ=$SRC/$PRJ"; } >> "$GITHUB_ENV"
+          find . -maxdepth 3 -name '*Info.plist' -not -path './build/*' | while read -r f; do /usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$f" || true; done
+          echo "✔ ok" >&3
+
+      - name: Archive (native)
+        if: ${{ env.NATIVE == '1' }}
+        run: |
+          exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
+          cd "$SRC"; . "$APP_ENV_FILE"
+          xcodebuild -project "$PRJ" -scheme "$SCHEME" -configuration Release \
+            -destination "$DEST" -archivePath "$RUNNER_TEMP/app.xcarchive" \
             OTHER_CODE_SIGN_FLAGS="--keychain $KC" archive
           echo "✔ ok" >&3
 
@@ -201,7 +286,7 @@ jobs:
             <key>signingStyle</key><string>manual</string>
             <key>teamID</key><string>${TEAM}</string>
             <key>signingCertificate</key><string>${SIGN_SHA1}</string>
-            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string></dict>
+            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>${WATCH_BUNDLE_ID:+<key>${WATCH_BUNDLE_ID}</key><string>${WATCH_PROFILE_UUID}</string>}</dict>
             <key>uploadSymbols</key><true/>
             <key>manageAppVersionAndBuildNumber</key><false/>
           </dict></plist>
