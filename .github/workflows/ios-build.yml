@@ -108,6 +108,7 @@ jobs:
           P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
           PROFILE_B64: ${{ secrets[format('{0}_PROFILE_B64', inputs.app)] }}
           WATCH_PROFILE_B64: ${{ secrets[format('{0}_WATCH_PROFILE_B64', inputs.app)] }}
+          EXT_PROFILE_B64: ${{ secrets[format('{0}_EXT_PROFILE_B64', inputs.app)] }}
           TEAM: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           exec 3>&1 >>"$LOG" 2>&1; set -E; trap 'echo "✖ failed" >&3' ERR
@@ -144,6 +145,19 @@ jobs:
               cp "$T/w.mobileprovision" "$d/$WUUID.mobileprovision"; done
             rm -f "$T/w.mobileprovision" "$T/w.plist"
             { echo "WATCH_PROFILE_UUID=$WUUID"; echo "WATCH_BUNDLE_ID=$WBUNDLE_ID"; } >> "$GITHUB_ENV"
+          fi
+          # optional 3rd profile for an app extension (e.g. a watchOS WidgetKit complication)
+          if [ -n "$EXT_PROFILE_B64" ]; then
+            printf '%s' "$EXT_PROFILE_B64" | base64 --decode > "$T/x.mobileprovision"
+            security cms -D -i "$T/x.mobileprovision" > "$T/x.plist"
+            XUUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$T/x.plist")
+            XAPPID=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$T/x.plist")
+            XBUNDLE_ID="${XAPPID#*.}"
+            for v in "$XUUID" "$XBUNDLE_ID"; do echo "::add-mask::$v" >&3; done
+            for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              cp "$T/x.mobileprovision" "$d/$XUUID.mobileprovision"; done
+            rm -f "$T/x.mobileprovision" "$T/x.plist"
+            { echo "EXT_PROFILE_UUID=$XUUID"; echo "EXT_BUNDLE_ID=$XBUNDLE_ID"; } >> "$GITHUB_ENV"
           fi
           echo "✔ ok" >&3
 
@@ -228,6 +242,7 @@ jobs:
             p = Xcodeproj::Project.open(ARGV[0])
             prof = { ENV["BUNDLE_ID"] => ENV["PROFILE_UUID"] }
             prof[ENV["WATCH_BUNDLE_ID"]] = ENV["WATCH_PROFILE_UUID"] if ENV["WATCH_BUNDLE_ID"].to_s != ""
+            prof[ENV["EXT_BUNDLE_ID"]] = ENV["EXT_PROFILE_UUID"] if ENV["EXT_BUNDLE_ID"].to_s != ""
             types = ["com.apple.product-type.application", "com.apple.product-type.application.watchapp2-container",
                      "com.apple.product-type.application.watchapp2", "com.apple.product-type.app-extension",
                      "com.apple.product-type.watchkit2-extension", "com.apple.product-type.extensionkit-extension"]
@@ -286,7 +301,7 @@ jobs:
             <key>signingStyle</key><string>manual</string>
             <key>teamID</key><string>${TEAM}</string>
             <key>signingCertificate</key><string>${SIGN_SHA1}</string>
-            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>${WATCH_BUNDLE_ID:+<key>${WATCH_BUNDLE_ID}</key><string>${WATCH_PROFILE_UUID}</string>}</dict>
+            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>${WATCH_BUNDLE_ID:+<key>${WATCH_BUNDLE_ID}</key><string>${WATCH_PROFILE_UUID}</string>}${EXT_BUNDLE_ID:+<key>${EXT_BUNDLE_ID}</key><string>${EXT_PROFILE_UUID}</string>}</dict>
             <key>uploadSymbols</key><true/>
             <key>manageAppVersionAndBuildNumber</key><false/>
           </dict></plist>
