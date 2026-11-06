@@ -1,0 +1,19 @@
+# Linux checks for the workflow scripts. Does not build or sign an app.
+name: shell-tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static and shell checks
+        run: bash tests/ios-build-workflow.test.sh
