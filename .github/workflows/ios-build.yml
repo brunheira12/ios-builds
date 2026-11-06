@@ -208,12 +208,74 @@ jobs:
             return 0
           }
 
+          # Opaque resource ids. The API examples use repo_…; Get Repo on this installation
+          # returned r_…. Both are a type prefix plus a body. Do not require one example prefix.
+          origin_validate_repository_id() {
+            id=$1
+            bad=$(printf '%s' "$id" | jq -Rr 'if test("^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_-]{1,200}$") then "" else "bad" end') || return 1
+            [ -z "$bad" ]
+          }
+
           origin_token_body() {
             if [ -n "${1:-}" ]; then
               printf '{"scopes":["repository:contents:read"],"repositoryIds":["%s"]}\n' "$1"
             else
               printf '%s\n' '{"scopes":["repository:contents:read"]}'
             fi
+          }
+
+          # Decide whether a Create Installation Access Token body is usable.
+          # Prints one line: "accept …" or "reject …". The line has lengths, key names,
+          # and character-class flags only — never the token or the error message text.
+          # Documented shape: a string with the oit_ prefix. The example is alphanumeric;
+          # the remainder may also be base64 or dotted. Bash glob ranges are not used
+          # because they follow LC_COLLATE on the macOS runner.
+          origin_token_decision() {
+            file=$1
+            http=$2
+            if ! out=$(jq -r --arg http "$http" '
+              def flag($t; $re): if ($t | test($re)) then "yes" else "no" end;
+              if type != "object" then
+                "reject http=\($http) body=not-object"
+              else
+                (keys | map(select(test("^[A-Za-z0-9_]+$"))) | join(",")) as $keys
+                | (.token | type) as $tt
+                | if $tt != "string" then
+                    "reject http=\($http) keys=\($keys) tokenType=\($tt)"
+                  else
+                    .token as $t
+                    | ($t | length) as $len
+                    | ($t | startswith("oit_")) as $pre
+                    | ($t | test("^oit_[-A-Za-z0-9._~+/=:]{8,4092}$")) as $ok
+                    | "\(if $ok then "accept" else "reject" end) http=\($http) keys=\($keys) tokenType=string tokenLen=\($len) prefix=\(if $pre then "yes" else "no" end) expiresAt=\(if (.expiresAt | type) == "string" then "yes" else "no" end) dot=\(flag($t; "\\.")) plus=\(flag($t; "\\+")) slash=\(flag($t; "/")) eq=\(flag($t; "=")) colon=\(flag($t; ":")) space=\(flag($t; "[[:space:]]")) other=\(flag($t; "[^A-Za-z0-9._~+/=:-]"))"
+                  end
+              end
+            ' "$file" 2>/dev/null); then
+              printf 'reject http=%s body=not-json\n' "$http"
+              return 1
+            fi
+            printf '%s\n' "$out"
+            case "$out" in
+              accept\ *) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # Safe metadata for a non-200 token response. No message text and no token.
+          origin_http_meta() {
+            file=$1
+            http=$2
+            if ! out=$(jq -r --arg http "$http" '
+              if type != "object" then
+                "http=\($http) body=not-object"
+              else
+                "http=\($http) keys=\(keys | map(select(test("^[A-Za-z0-9_]+$"))) | join(",")) code=\(if (.code | type) == "number" then .code else "none" end) message=\(if (.message | type) == "string" then "yes" else "no" end)"
+              end
+            ' "$file" 2>/dev/null); then
+              printf 'http=%s body=not-json\n' "$http"
+              return 0
+            fi
+            printf '%s\n' "$out"
           }
 
           origin_rewrite_submodule_url() {
@@ -315,13 +377,9 @@ jobs:
             esac
             repo_id=${ORIGIN_REPOSITORY_ID:-}
             if [ -n "$repo_id" ]; then
-              case "$repo_id" in
-                repo_[A-Za-z0-9]*) ;;
-                *) origin_fail "invalid repository id" ;;
-              esac
-              case "$repo_id" in
-                *[!A-Za-z0-9_]*) origin_fail "invalid repository id" ;;
-              esac
+              if ! origin_validate_repository_id "$repo_id"; then
+                origin_fail "invalid repository id: unset ORIGIN_REPOSITORY_ID for one selected repository, or set the id from Get Repo (r_… or repo_…)"
+              fi
             fi
 
             # Never reuse a developer session token that may already be in the environment.
@@ -371,24 +429,23 @@ jobs:
               origin_fail "origin token request failed"
             fi
             if [ "$http" != "200" ]; then
-              printf 'token http %s\n' "$http"
-              if [ -f "$resp_file" ]; then
-                sed -E 's/oit_[A-Za-z0-9._-]+/[redacted]/g' "$resp_file" || true
-              fi
-              origin_fail "origin token request rejected"
+              meta=$(origin_http_meta "$resp_file" "$http")
+              printf 'token request %s\n' "$meta"
+              origin_fail "origin token request rejected: $meta"
             fi
-            token=$(jq -er '.token' "$resp_file")
-            case "$token" in
-              oit_[A-Za-z0-9]*) ;;
-              *) origin_fail "origin token missing" ;;
-            esac
-            case "$token" in
-              *[!A-Za-z0-9_-]*) origin_fail "origin token missing" ;;
-            esac
-            printf '::add-mask::%s\n' "$token" >&3
+            set +e
+            decision=$(origin_token_decision "$resp_file" "$http")
+            decision_st=$?
+            set -e
+            if [ "$decision_st" -ne 0 ]; then
+              printf 'token decision %s\n' "$decision"
+              origin_fail "origin token unusable: ${decision#reject }"
+            fi
             TOK="$AUTH/token"
-            printf '%s' "$token" > "$TOK"
+            jq -er '.token' "$resp_file" > "$TOK"
             chmod 600 "$TOK"
+            token=$(cat "$TOK")
+            printf '::add-mask::%s\n' "$token" >&3
             rm -f "$resp_file"
             unset token app_jwt signature || true
             export ORIGIN_TOKEN_FILE="$TOK"

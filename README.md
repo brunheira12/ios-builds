@@ -56,7 +56,7 @@ Secrets (names only):
 | `ORIGIN_APP_ID` | App id, `app_...`. |
 | `ORIGIN_INSTALLATION_ID` | Installation id from the installation URL. |
 | `ORIGIN_APP_PRIVATE_KEY` | PEM of the Ed25519 private key (`BEGIN PRIVATE KEY`). |
-| `ORIGIN_REPOSITORY_ID` | Optional `repo_...`. When set, the installation token is limited to that repository. |
+| `ORIGIN_REPOSITORY_ID` | Optional. Leave unset when the app is installed on this one repository. If set, use the `id` from Get Repo: live ids look like `r_…`, and the API examples look like `repo_…`. |
 
 Not used for this compile-only run: `APP10_DEPLOY_KEY`, `APP10_PROFILE_B64`, `APP10_WATCH_PROFILE_B64`, `APP10_EXT_PROFILE_B64`, the distribution certificate, and the App Store Connect API key. `LOG_PUBKEY` is still required; the encrypted log artifact is the same as for signed builds.
 
@@ -69,7 +69,7 @@ Follow [Build an Origin App](https://cursor.com/docs/origin/apps/build-app) and 
 3. Install it on the owner of `jefferson-brunheira/super16`, selected repositories only, scope `repository:contents:read` only.
 4. Copy the app id and the installation id (`/codebase/settings/apps/installations/{installationId}`) into the secrets above. Store the private PEM as `ORIGIN_APP_PRIVATE_KEY`.
 
-The job signs an app JWT (`alg` EdDSA, `iss` and `kid` = app id, `aud` origin-apps, 15 minute lifetime) and exchanges it for an installation token. The token expires within 15 minutes and is minted at checkout. A missing app, a rejected JWT, or an HTTP 403 from an enforced team inbound IP allowlist fails the step. Personal namespaces have no inbound IP allowlist. A team allowlist that is enforced must admit the GitHub-hosted macOS runner, or checkout returns 403. Nothing in this repo bypasses that.
+The job signs an app JWT (`alg` EdDSA, `iss` and `kid` = app id, `aud` origin-apps, 15 minute lifetime) and exchanges it for an installation token. The token expires within 15 minutes and is minted at checkout. A usable token is the documented `oit_` string. A missing app, a non-200 response, or an HTTP 403 from an enforced team inbound IP allowlist fails the step. The public log then has the HTTP status, JSON key names, and (for a 200 body that is not a usable token) length and character-class flags. It does not include the token or the error message text. Personal namespaces have no inbound IP allowlist. A team allowlist that is enforced must admit the GitHub-hosted macOS runner, or checkout returns 403. Nothing in this repo bypasses that.
 
 After checkout the encrypted log records the full commit SHA, each submodule path and gitlink SHA, and a `snes9x <sha>` line when a submodule matches. The public log does not include those values. On compile failure the public log adds `xcodebuild exit <status>` and diagnostic lines (`error:`, linker, `** BUILD FAILED **`) with runner paths removed. Source lines, tokens, and private keys are not printed there. The full transcript stays in the encrypted artifact `log-<run id>`.
 
