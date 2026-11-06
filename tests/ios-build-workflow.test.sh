@@ -34,6 +34,54 @@ bash -n tests/ios-build-workflow.test.sh
   origin_validate_relpath "a/../../b" && fail "accepted dotdot path"
   [ "$(origin_token_body "")" = '{"scopes":["repository:contents:read"]}' ]
   [ "$(origin_token_body "repo_abc123")" = '{"scopes":["repository:contents:read"],"repositoryIds":["repo_abc123"]}' ]
+  origin_validate_repository_id "r_01m6rdmrh3f7d9pprch6yff5eq"
+  origin_validate_repository_id "repo_01k2ja2000e0080000000000q4"
+  origin_validate_repository_id "repo_abc123"
+  origin_validate_repository_id "repo_" && fail "accepted empty repository id body"
+  origin_validate_repository_id "../etc" && fail "accepted path repository id"
+  origin_validate_repository_id 'id"injection' && fail "accepted quoted repository id"
+  tokdir=$(mktemp -d)
+  documented='oit_2v8xkq4m1c7p9t3w5y0z6r4b'
+  printf '{"token":"%s","expiresAt":"2026-08-01T10:30:00Z"}\n' "$documented" > "$tokdir/ok.json"
+  decision=$(LC_ALL=en_US.UTF-8 origin_token_decision "$tokdir/ok.json" 200)
+  case "$decision" in
+    accept\ *) ;;
+    *) fail "documented token rejected: $decision" ;;
+  esac
+  printf '%s\n' "$decision" | grep -F "$documented" && fail "decision leaked the token"
+  dotted='oit_ab.cd+ef/gh=ij12'
+  printf '{"token":"%s","expiresAt":"2026-08-01T10:30:00Z"}\n' "$dotted" > "$tokdir/dot.json"
+  decision=$(origin_token_decision "$tokdir/dot.json" 200)
+  case "$decision" in
+    accept\ *) ;;
+    *) fail "dotted token rejected: $decision" ;;
+  esac
+  printf '%s\n' "$decision" | grep -F 'prefix=yes' >/dev/null
+  printf '%s\n' "$decision" | grep -F 'dot=yes' >/dev/null
+  printf '%s\n' "$decision" | grep -F "$dotted" && fail "decision leaked dotted token"
+  printf '{"token":"SENTINELTOKENVALUE","expiresAt":"2026-08-01T10:30:00Z"}\n' > "$tokdir/bad.json"
+  set +e
+  decision=$(origin_token_decision "$tokdir/bad.json" 200)
+  sel=$?
+  set -e
+  [ "$sel" -ne 0 ]
+  printf '%s\n' "$decision" | grep -F 'prefix=no' >/dev/null
+  printf '%s\n' "$decision" | grep -F 'SENTINELTOKENVALUE' && fail "decision leaked a rejected token"
+  printf '{"expiresAt":"2026-08-01T10:30:00Z"}\n' > "$tokdir/missing.json"
+  set +e
+  decision=$(origin_token_decision "$tokdir/missing.json" 200)
+  sel=$?
+  set -e
+  [ "$sel" -ne 0 ]
+  printf '%s\n' "$decision" | grep -F 'tokenType=null' >/dev/null
+  printf '{"message":"Issuer is not authorized SENTINELTOKENVALUE"}\n' > "$tokdir/err.json"
+  meta=$(origin_http_meta "$tokdir/err.json" 401)
+  printf '%s\n' "$meta" | grep -F 'http=401' >/dev/null
+  printf '%s\n' "$meta" | grep -F 'message=yes' >/dev/null
+  printf '%s\n' "$meta" | grep -F 'code=none' >/dev/null
+  printf '%s\n' "$meta" | grep -F 'SENTINELTOKENVALUE' && fail "http meta leaked response text"
+  printf '%s\n' "$meta" | grep -F 'Issuer' && fail "http meta leaked the error message"
+  rm -rf "$tokdir"
   [ "$(origin_rewrite_submodule_url "git@github.com:snes9xgit/snes9x.git")" = "https://github.com/snes9xgit/snes9x.git" ]
   [ "$(origin_rewrite_submodule_url "ssh://git@github.com/snes9xgit/snes9x.git")" = "https://github.com/snes9xgit/snes9x.git" ]
   [ "$(origin_rewrite_submodule_url "git@origin.cursor.com:jefferson-brunheira/super16.git")" = "https://origin.cursor.com/jefferson-brunheira/super16.git" ]
@@ -272,31 +320,31 @@ PY
 }
 
 run_checkout() {
-  runner=$1
+  work=$1
   sha=$2
   ref=$3
   bindir=$4
   bare=$5
   subbare=$6
-  mkdir -p "$runner"
-  env_file=$runner/github.env
+  mkdir -p "$work"
+  env_file=$work/github.env
   : > "$env_file"
-  public=$runner/public.txt
-  private=$runner/private.txt
-  gitlog=$runner/git.log
-  urls=$runner/urls.txt
-  curllog=$runner/curl.log
+  public=$work/public.txt
+  private=$work/private.txt
+  gitlog=$work/git.log
+  urls=$work/urls.txt
+  curllog=$work/curl.log
   : > "$gitlog"; : > "$urls"; : > "$curllog"
-  key=$runner/app.pem
+  key=$work/app.pem
   openssl genpkey -algorithm ED25519 -out "$key" >/dev/null 2>&1
-  pub=$runner/app.pub
+  pub=$work/app.pub
   openssl pkey -in "$key" -pubout -out "$pub" >/dev/null 2>&1
   pem=$(cat "$key")
   set +e
   PATH="$bindir:$PATH" \
-    RUNNER_TEMP="$runner" \
+    RUNNER_TEMP="$work" \
     GITHUB_ENV="$env_file" \
-    SRC="$runner/src/" \
+    SRC="$work/src/" \
     APP_REPO=jefferson-brunheira/super16 \
     APP_REF="$ref" \
     APP_BRANCH=main \
@@ -318,25 +366,25 @@ run_checkout() {
     bash scripts/origin-checkout.sh >"$private" 2>&1 3>"$public"
   st=$?
   set -e
-  printf '%s\n' "$st" > "$runner/status"
-  printf '%s\n' "$pub" > "$runner/pubpath"
+  printf '%s\n' "$st" > "$work/status"
+  printf '%s\n' "$pub" > "$work/pubpath"
 }
 
 assert_no_secret_leak() {
-  runner=$1
+  work=$1
   token=oit_testtokenvalue0123
   # Mask commands are the only public lines allowed to carry the JWT or token.
-  awk 'index($0, "::add-mask::") != 1' "$runner/public.txt" > "$runner/public-visible.txt"
-  if grep -F "$token" "$runner/public-visible.txt" >/dev/null; then
+  awk 'index($0, "::add-mask::") != 1' "$work/public.txt" > "$work/public-visible.txt"
+  if grep -F "$token" "$work/public-visible.txt" >/dev/null; then
     fail "token visible on the public log"
   fi
-  if grep -F "BEGIN PRIVATE" "$runner/public-visible.txt" "$runner/private.txt" "$runner/git.log" "$runner/curl.log" >/dev/null; then
+  if grep -F "BEGIN PRIVATE" "$work/public-visible.txt" "$work/private.txt" "$work/git.log" "$work/curl.log" >/dev/null; then
     fail "private key leaked into logs"
   fi
-  if grep -F "$token" "$runner/git.log" "$runner/curl.log" "$runner/private.txt" >/dev/null; then
+  if grep -F "$token" "$work/git.log" "$work/curl.log" "$work/private.txt" >/dev/null; then
     fail "token leaked into git argv, curl argv, or the build log"
   fi
-  if [ -d "$runner/origin-auth" ]; then
+  if [ -d "$work/origin-auth" ]; then
     fail "origin auth directory was left behind"
   fi
 }
@@ -403,6 +451,26 @@ if grep -F "x-access-token" "$runner/src/.git/config" >/dev/null; then
   fail "token stored in git config"
 fi
 grep -F 'url = https://github.com/snes9xgit/snes9x.git' "$runner/src/.gitmodules" >/dev/null
+runner_r=$(mktemp -d)
+ORIGIN_REPOSITORY_ID='r_01m6rdmrh3f7d9pprch6yff5eq' \
+  MOCK_CURL_BODY='{"token":"oit_testtokenvalue0123","expiresAt":"2099-01-01T00:00:00Z"}' \
+  run_checkout "$runner_r" "$sha" "$sha" "$bindir" "$fix/parent.git" "$fix/sub.git"
+[ "$(cat "$runner_r/status")" = "0" ] || { cat "$runner_r/private.txt"; cat "$runner_r/public.txt"; fail "Get Repo r_ id was rejected"; }
+grep -F 'r_01m6rdmrh3f7d9pprch6yff5eq' "$runner_r/curl.log" >/dev/null
+grep -F 'repository:contents:read' "$runner_r/curl.log" >/dev/null
+if grep -F 'repository:contents:write' "$runner_r/curl.log" >/dev/null; then
+  fail "r_ id token requested write scope"
+fi
+assert_no_secret_leak "$runner_r"
+runner_badid=$(mktemp -d)
+ORIGIN_REPOSITORY_ID='../not-an-id' \
+  MOCK_CURL_BODY='{"token":"oit_testtokenvalue0123","expiresAt":"2099-01-01T00:00:00Z"}' \
+  run_checkout "$runner_badid" "$sha" "$sha" "$bindir" "$fix/parent.git" "$fix/sub.git"
+[ "$(cat "$runner_badid/status")" != "0" ]
+grep -F "invalid repository id" "$runner_badid/public.txt" >/dev/null
+if [ -s "$runner_badid/curl.log" ]; then
+  fail "invalid repository id still called the token API"
+fi
 sub_head=$(git -C "$runner/src/ThirdParty/snes9x" rev-parse HEAD)
 pin=$(git -C "$runner/src" ls-tree HEAD ThirdParty/snes9x | awk '{print $3}')
 [ "$sub_head" = "$pin" ] || fail "snes9x pin was not checked out"
@@ -429,10 +497,14 @@ MOCK_CURL_CODE=401 MOCK_CURL_BODY='{"message":"Issuer is not authorized oit_secr
   run_checkout "$runner401" "$sha" "$sha" "$bindir" "$fix/parent.git" "$fix/sub.git"
 [ "$(cat "$runner401/status")" != "0" ]
 grep -F "origin token request rejected" "$runner401/public.txt" >/dev/null
+grep -F "http=401" "$runner401/public.txt" >/dev/null
+grep -F "message=yes" "$runner401/public.txt" >/dev/null
 if grep -F "oit_secretleak" "$runner401/public.txt" "$runner401/private.txt" >/dev/null; then
   fail "rejected token body leaked"
 fi
-grep -F "[redacted]" "$runner401/private.txt" >/dev/null
+if grep -F "Issuer is not authorized" "$runner401/public.txt" "$runner401/private.txt" >/dev/null; then
+  fail "rejected response text leaked"
+fi
 assert_no_secret_leak "$runner401"
 
 runner_miss=$(mktemp -d)
